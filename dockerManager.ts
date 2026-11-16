@@ -10,6 +10,7 @@ import {
   ServiceName,
 } from './services';
 import $$ from './projectExec';
+import { logError } from './utils/logging';
 import { ensureScreenerCheckout, getCranSnapshotDate } from './screener';
 
 export type DockerStatus = 'running' | 'stopped' | 'unknown';
@@ -557,19 +558,18 @@ async function prepareDockerImages(
 }
 
 /**
- * The `compose stop` calls still in progress, by the services they're
- * stopping.
+ * The stops still in progress, by the services they're stopping.
  *
  * `compose up -d` leaves a container it finds running alone, and a container
- * that `compose stop` has sent SIGTERM to is still running until it exits -
- * which SQL Server and Azurite only do when the ten-second timeout kills
- * them. So a start issued while a stop-all is still draining (stop
- * everything, then start admin, say) skips exactly the services that take
- * longest to stop, and reports them up a few seconds before they die. The
- * Functions hosts that depend on them then build, launch, and fault on a
- * storage account nobody is listening at, which looks for all the world like
- * a broken Core Tools. Waiting for the stop to finish first means `up` sees
- * the exited container and starts it.
+ * being stopped is still running until it exits - which takes Azurite the
+ * whole ten-second timeout, and SQL Server a second or two of its own clean
+ * shutdown (see `stopDbService`). So a start issued while a stop-all is
+ * still draining (stop everything, then start admin, say) skips exactly the
+ * services that take longest to stop, and reports them up a few seconds
+ * before they die. The Functions hosts that depend on them then build,
+ * launch, and fault on a storage account nobody is listening at, which looks
+ * for all the world like a broken Core Tools. Waiting for the stop to finish
+ * first means `up` sees the exited container and starts it.
  */
 const pendingStops = new Map<DockerService, Promise<void>>();
 
@@ -620,6 +620,69 @@ export async function startDockerServices(
   }
 }
 
+/** How long SQL Server gets to finish its own shutdown before it's killed. */
+const SQLSERVR_EXIT_TIMEOUT_MS = 60_000;
+const SQLSERVR_EXIT_POLL_MS = 500;
+
+/**
+ * Stops the db container with SQL Server shut down cleanly first.
+ *
+ * A plain `compose stop` can't do that: docker-compose.yml runs SQL Server
+ * in the background of a bash script that ends in `sleep infinity`, and that
+ * script - bash, then the `sleep` it execs into - is the container's PID 1.
+ * PID 1 ignores any signal it has no handler for, so the SIGTERM never
+ * reaches SQL Server, and after ten seconds Docker kills the lot (exit 137)
+ * with the data files mid-flight. They're only
+ * crash-consistent at that point: fine for this checkout, which recovers on
+ * its next start, but not for a data directory someone's about to zip up
+ * and share.
+ *
+ * So the SIGTERM goes to SQL Server directly. Its oldest process is the
+ * parent that supervises the real server, and it passes the stop on - SQL
+ * Server logs "terminating in response to a 'stop' request", checkpoints
+ * every database and exits. Only the wrapper script is left after that, which
+ * has nothing to lose, so it's stopped without waiting out the timeout.
+ */
+async function stopDbService(): Promise<void> {
+  // Non-zero when there's nothing to signal: no sqlservr process (pkill
+  // exits 1), or no running container at all, which `compose exec` refuses.
+  const { exitCode } = await $$({
+    reject: false,
+  })`docker compose exec -T db pkill -TERM -o -x sqlservr`;
+
+  if (exitCode === 0) {
+    const deadline = Date.now() + SQLSERVR_EXIT_TIMEOUT_MS;
+
+    for (;;) {
+      // -r: live processes only. Once the startup script reaches its
+      // `sleep infinity`, the shell execs into it, and `sleep` as PID 1
+      // never reaps the children it inherits - so an exited sqlservr stays
+      // in the process table as a zombie until the container is stopped,
+      // and a plain `pgrep` would wait out the whole timeout on it.
+      // eslint-disable-next-line no-await-in-loop
+      const { exitCode: running } = await $$({
+        reject: false,
+      })`docker compose exec -T db pgrep -r R,S,D,T -x sqlservr`;
+
+      if (running !== 0) {
+        break;
+      }
+
+      if (Date.now() >= deadline) {
+        logError(
+          `SQL Server in the db container was still shutting down after ${SQLSERVR_EXIT_TIMEOUT_MS / 1000} seconds, so it's been killed. Its databases will go through crash recovery on the next start.`,
+        );
+        break;
+      }
+
+      // eslint-disable-next-line no-await-in-loop
+      await delay(SQLSERVR_EXIT_POLL_MS);
+    }
+  }
+
+  await $$`docker compose stop --timeout 0 db`;
+}
+
 export async function stopDockerServices(
   services: DockerService[],
 ): Promise<void> {
@@ -629,7 +692,12 @@ export async function stopDockerServices(
 
   services.forEach(service => startFailures.delete(service));
 
-  const stop = $$`docker compose stop ${services}`;
+  const others = services.filter(service => service !== 'db');
+
+  const stop = Promise.all([
+    others.length > 0 ? $$`docker compose stop ${others}` : undefined,
+    services.includes('db') ? stopDbService() : undefined,
+  ]);
   // A start waiting on this only needs to know the stop is over, not whether
   // it worked - that's for the caller that asked for the stop.
   const settled: Promise<void> = stop.then(
